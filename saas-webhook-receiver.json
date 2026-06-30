@@ -1,0 +1,398 @@
+{
+  "name": "saas-webhook-receiver",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "saas/webhook",
+        "options": {}
+      },
+      "id": "wh-verify",
+      "name": "Webhook Verification",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 100],
+      "notes": "Meta webhook verification (GET). Must respond with hub.challenge value to activate the webhook.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const d = item.json;\n  const mode = d['hub.mode'];\n  const challenge = d['hub.challenge'];\n  const token = d['hub.verify_token'];\n  const expected = $env.META_WEBHOOK_VERIFY_TOKEN || '';\n  const valid = mode === 'subscribe' && token === expected && !!challenge;\n  return { json: { _token_valid: valid, _challenge: challenge, _token_error: valid ? null : 'Verify token mismatch' } };\n});"
+      },
+      "id": "check-verify-token",
+      "name": "Check Verify Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 100],
+      "notes": "Verifies Meta's hub.verify_token against META_WEBHOOK_VERIFY_TOKEN env var.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [{ "id": "t-valid", "leftValue": "={{ $json._token_valid }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "token-valid-if",
+      "name": "Token Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [450, 280],
+      "notes": "Routes valid tokens to challenge response, invalid to 403.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json._challenge }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "text/plain" }] }
+        }
+      },
+      "id": "challenge-response",
+      "name": "Challenge Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [650, 100],
+      "notes": "Returns hub.challenge to verify webhook endpoint.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Invalid verify token",
+        "options": {
+          "responseCode": 403,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "text/plain" }] }
+        }
+      },
+      "id": "invalid-token-response",
+      "name": "Invalid Token Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [650, 280],
+      "notes": "Returns 403 if verify_token doesn't match.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "saas/webhook",
+        "options": {}
+      },
+      "id": "wh-events",
+      "name": "Webhook Events",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 520],
+      "notes": "Receives POST events from Meta: delivery receipts, read receipts, failures, and button replies.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const crypto = require('crypto');\nconst items = $input.all();\nreturn items.map(item => {\n  const headers = item.json.headers || item.json._headers || {};\n  const signature = headers['x-hub-signature-256'] || '';\n  const secret = $env.META_WEBHOOK_SECRET || '';\n  if (!signature || !secret) return { json: { ...item.json, _sig_valid: false, _sig_error: 'Missing signature or secret' } };\n  const raw = JSON.stringify(item.json.entry ? item.json : { body: item.json });\n  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');\n  return { json: { ...item.json, _sig_valid: signature === expected, _sig_error: signature === expected ? null : 'Signature mismatch' } };\n});"
+      },
+      "id": "verify-sig",
+      "name": "Verify Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 520],
+      "notes": "Verifies X-Hub-Signature-256 HMAC-SHA256. For production, enable Raw Body on the Webhook node. Set META_WEBHOOK_SECRET in env.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [{ "id": "s-valid", "leftValue": "={{ $json._sig_valid }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "sig-valid-if",
+      "name": "Signature Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [450, 700],
+      "notes": "Routes valid signatures to processing, invalid to log and acknowledge.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => ({ json: { ...item.json, _event_type: 'sig_invalid', _log: 'Invalid signature: ' + (item.json._sig_error || 'unknown') } }));"
+      },
+      "id": "sig-invalid-log",
+      "name": "Log Invalid Sig",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [650, 700],
+      "notes": "Logs invalid signature and still acks 200 to prevent Meta retries.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const value = item.json.entry?.[0]?.changes?.[0]?.value;\n  if (!value) return { json: { ...item.json, _event_type: 'other' } };\n  const statuses = value.statuses;\n  if (statuses?.length) {\n    const s = statuses[0];\n    const errors = s.errors || [];\n    return { json: { ...item.json, _event_type: s.status, _provider_message_id: s.id, _recipient_id: s.recipient_id, _status_timestamp: s.timestamp, _conversation_id: s.conversation?.id, _pricing: s.pricing, _errors: errors, _error_title: errors[0]?.title } };\n  }\n  const msgs = value.messages;\n  if (msgs?.length) {\n    const m = msgs[0];\n    if (m.type === 'interactive' && m.interactive?.type === 'button_reply') {\n      const parts = (m.interactive.button_reply.id || '').split('|');\n      return { json: { ...item.json, _event_type: 'button_reply', _button_action: parts[0], order_id: parts.slice(1).join('|'), _provider_message_id: m.id, phone: m.from, _msg_timestamp: m.timestamp } };\n    }\n  }\n  return { json: { ...item.json, _event_type: 'other' } };\n});"
+      },
+      "id": "parse-events",
+      "name": "Parse Events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [650, 520],
+      "notes": "Parses Meta webhook payload: extracts status (delivered/read/failed) and button_reply events. For button replies, parses order_id from CONFIRM_ORDER|uuid format.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json._event_type }}",
+        "rules": {
+          "string": {
+            "rules": [
+              { "output": 0, "value2": "button_reply" },
+              { "output": 1, "value2": "delivered" },
+              { "output": 2, "value2": "read" },
+              { "output": 3, "value2": "failed" }
+            ]
+          }
+        },
+        "options": {},
+        "fallbackOutput": 4
+      },
+      "id": "route-event",
+      "name": "Route Event",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 2,
+      "position": [850, 520],
+      "notes": "Routes events to handlers: button_reply → order update, delivered/read/failed → status tracking.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const action = item.json._button_action;\n  const status = action === 'CONFIRM_ORDER' ? 'confirmed' : action === 'CANCEL_ORDER' ? 'cancelled' : 'unknown';\n  return { json: { ...item.json, _new_status: status, _confirmation_time: new Date().toISOString() } };\n});"
+      },
+      "id": "parse-button-reply",
+      "name": "Parse Button Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1050, 380],
+      "notes": "Maps button action: CONFIRM_ORDER → confirmed, CANCEL_ORDER → cancelled.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/orders?order_id=eq.' + encodeURIComponent($json.order_id) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"status\": $json._new_status, \"confirmation_time\": $json._confirmation_time, \"provider_message_id\": $json._provider_message_id } }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-order-status",
+      "name": "Update Order Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1250, 380],
+      "notes": "Updates orders table with confirmed/cancelled status from button reply.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_logs?provider_message_id=eq.' + encodeURIComponent($json._provider_message_id) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"status\": $json._event_type === 'delivered' ? 'delivered' : $json._event_type === 'read' ? 'read' : 'failed' } }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-log-status",
+      "name": "Update Log Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1050, 600],
+      "notes": "Updates message_logs with delivery/read/failed status using provider_message_id.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_status' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"provider_message_id\": $json._provider_message_id, \"store_id\": $json.id || null, \"status\": $json._event_type, \"error_message\": $json._error_title || null, \"recipient_id\": $json._recipient_id || null, \"timestamp\": $json._status_timestamp ? new Date(parseInt($json._status_timestamp) * 1000).toISOString() : new Date().toISOString(), \"raw_payload\": { event_type: $json._event_type, conversation_id: $json._conversation_id } } }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "insert-message-status",
+      "name": "Insert Message Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1050, 720],
+      "notes": "Inserts delivery/read/failed event into message_status table for audit trail.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/orders?provider_message_id=eq.' + encodeURIComponent($json._provider_message_id) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ (() => {\n  const ev = $json._event_type;\n  const upd = { status: ev };\n  if (ev === 'delivered') upd.delivered_at = new Date().toISOString();\n  if (ev === 'read') upd.read_at = new Date().toISOString();\n  if (ev === 'failed') upd.error_message = $json._error_title || 'Webhook delivery failure';\n  return upd;\n})() }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-orders-status",
+      "name": "Update Orders Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1250, 600],
+      "notes": "Updates orders table with delivery/read/failed status and timestamps using provider_message_id.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/refresh_metrics' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"p_store_id\": $json.id || null } }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "refresh-metrics-webhook",
+      "name": "Refresh Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1250, 720],
+      "notes": "Refreshes metrics cache after status update.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"success\":true}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "ack-webhook",
+      "name": "Acknowledge Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1500, 520],
+      "notes": "Always returns 200 to Meta to prevent retries.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Webhook Verification": {
+      "main": [[{ "node": "Check Verify Token", "type": "main", "index": 0 }]]
+    },
+    "Check Verify Token": {
+      "main": [[{ "node": "Token Valid?", "type": "main", "index": 0 }]]
+    },
+    "Token Valid?": {
+      "main": [
+        [{ "node": "Challenge Response", "type": "main", "index": 0 }],
+        [{ "node": "Invalid Token Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Webhook Events": {
+      "main": [[{ "node": "Verify Signature", "type": "main", "index": 0 }]]
+    },
+    "Verify Signature": {
+      "main": [[{ "node": "Signature Valid?", "type": "main", "index": 0 }]]
+    },
+    "Signature Valid?": {
+      "main": [
+        [{ "node": "Parse Events", "type": "main", "index": 0 }],
+        [{ "node": "Log Invalid Sig", "type": "main", "index": 0 }]
+      ]
+    },
+    "Log Invalid Sig": {
+      "main": [[{ "node": "Acknowledge Webhook", "type": "main", "index": 0 }]]
+    },
+    "Parse Events": {
+      "main": [[{ "node": "Route Event", "type": "main", "index": 0 }]]
+    },
+    "Route Event": {
+      "main": [
+        [{ "node": "Parse Button Reply", "type": "main", "index": 0 }],
+        [{ "node": "Update Log Status", "type": "main", "index": 0 }],
+        [{ "node": "Update Log Status", "type": "main", "index": 0 }],
+        [{ "node": "Update Log Status", "type": "main", "index": 0 }],
+        [{ "node": "Acknowledge Webhook", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse Button Reply": {
+      "main": [[{ "node": "Update Order Status", "type": "main", "index": 0 }]]
+    },
+    "Update Order Status": {
+      "main": [[{ "node": "Acknowledge Webhook", "type": "main", "index": 0 }]]
+    },
+    "Update Log Status": {
+      "main": [[{ "node": "Insert Message Status", "type": "main", "index": 0 }]]
+    },
+    "Insert Message Status": {
+      "main": [[{ "node": "Update Orders Status", "type": "main", "index": 0 }]]
+    },
+    "Update Orders Status": {
+      "main": [[{ "node": "Refresh Metrics", "type": "main", "index": 0 }]]
+    },
+    "Refresh Metrics": {
+      "main": [[{ "node": "Acknowledge Webhook", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "tags": [],
+  "pinData": {}
+}

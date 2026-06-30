@@ -1,0 +1,798 @@
+{
+  "name": "OrderConfirm AI Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "saas/ai-agent",
+        "options": {}
+      },
+      "id": "wh-receive",
+      "name": "Receive WhatsApp Message",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "notes": "Entry: POST /webhook/saas/ai-agent. Accepts forwarded messages from webhook-receiver or direct Meta webhook. Payload: {store_id, phone, order_id?, message_text, message_type?, language?}",
+      "notesInFlow": true,
+      "webhookId": "saas/ai-agent"
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const d = item.json;\n  const body = d.body || d;\n  const storeId = body.store_id || body._store_id || '';\n  const phone = (body.phone || '').replace(/[^0-9+]/g, '');\n  const orderId = body.order_id || '';\n  const msgText = (body.message_text || body.text || '').trim();\n  const msgType = body.message_type || 'text';\n  const lang = body.language || 'dz';\n  const missing = [];\n  if (!storeId) missing.push('store_id');\n  if (!phone) missing.push('phone');\n  if (!msgText) missing.push('message_text');\n  return {\n    json: {\n      ...d,\n      _store_id: storeId,\n      _phone: phone,\n      _order_id: orderId,\n      _message_text: msgText.substring(0, 4096),\n      _message_type: msgType,\n      _language: lang,\n      _valid: missing.length === 0,\n      _missing: missing,\n      _idempotency_key: storeId + '_' + phone + '_' + Date.now()\n    }\n  };\n});"
+      },
+      "id": "validate-extract",
+      "name": "Validate & Extract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [500, 300],
+      "notes": "Validates required fields (store_id, phone, message_text). Sanitizes phone, truncates message to 4096 chars. Generates idempotency key.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [
+            { "id": "v-check", "leftValue": "={{ $json._valid }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-valid",
+      "name": "Valid Input?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [700, 300],
+      "notes": "Routes valid input to store fetch, invalid to 400 error response.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": false, \"error\": \"Missing required fields\", \"missing\": $json._missing} }}",
+        "options": {
+          "responseCode": 400,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "resp-error-400",
+      "name": "Error Response 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [700, 500],
+      "notes": "Returns 400 with missing field details.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/stores?id=eq.' + encodeURIComponent($json._store_id) + '&limit=1' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Accept", "value": "application/vnd.pgrst.object+json" }
+          ]
+        },
+        "options": { "timeout": 10000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "fetch-store",
+      "name": "Find Store",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [950, 300],
+      "notes": "Fetches store config by store_id. Returns single object via Accept header.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [
+            { "id": "s-check", "leftValue": "={{ $json.id }}", "rightValue": null, "operator": { "type": "string", "operation": "isNotEmpty" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-store",
+      "name": "Store Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1150, 300],
+      "notes": "If store not found or inactive, returns 404 error.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": false, \"error\": \"Store not found or inactive\", \"store_id\": $json._store_id} }}",
+        "options": {
+          "responseCode": 404,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "resp-store-error",
+      "name": "Store Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1150, 500],
+      "notes": "Returns 404 if store not found.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/get_ai_settings' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"p_store_id\": $json.id } }}",
+        "options": { "timeout": 10000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "fetch-ai-settings",
+      "name": "Get AI Settings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1400, 300],
+      "notes": "Calls get_ai_settings RPC. Returns merchant AI config with defaults if not set. Ensures merchant isolation — each store gets its own settings.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [
+            { "id": "ai-en", "leftValue": "={{ $json.enabled }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-ai-enabled",
+      "name": "AI Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1600, 300],
+      "notes": "Checks if AI agent is enabled for this merchant. Each merchant controls this independently.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": false, \"error\": \"AI agent is disabled for this store\", \"store_id\": $json.id} }}",
+        "options": {
+          "responseCode": 403,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "resp-ai-disabled",
+      "name": "AI Disabled Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1600, 500],
+      "notes": "Returns 403 if AI agent is disabled for this merchant.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/orders?phone=eq.' + encodeURIComponent($json._phone) + '&store_id=eq.' + encodeURIComponent($json.id || $json._store_id) + '&order=created_at.desc&limit=1' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Accept", "value": "application/vnd.pgrst.object+json" }
+          ]
+        },
+        "options": { "timeout": 10000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "fetch-order",
+      "name": "Find Latest Customer Order",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1850, 300],
+      "notes": "Finds the latest order by phone number for this store. Orders sorted by created_at desc.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [
+            { "id": "o-check", "leftValue": "={{ $json.id }}", "rightValue": null, "operator": { "type": "string", "operation": "isNotEmpty" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-order",
+      "name": "Order Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2050, 300],
+      "notes": "If no order found for this phone number, returns 404. Otherwise continues to load conversation history.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": false, \"error\": \"No order found for this phone number\", \"phone\": $json._phone} }}",
+        "options": {
+          "responseCode": 404,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "resp-order-error",
+      "name": "Order Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2050, 500],
+      "notes": "Returns 404 if no matching order.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/get_ai_conversation' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"p_store_id\": $json.id || $json._store_id, \"p_phone\": $json._phone, \"p_limit\": 20 } }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "load-history",
+      "name": "Load Conversation History",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2300, 300],
+      "notes": "Loads last 20 messages from ai_conversations for context. Max 20 messages per order.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const j = item.json;\n  const store = j._store || j;\n  const order = j._order || j;\n  const settings = j._ai_settings || j;\n  const history = Array.isArray(j) ? j : (j._history || []);\n  \n  const msgCount = history.length;\n  const lang = settings.language || j._language || 'dz';\n  const maxMsgs = settings.max_messages || 20;\n  const needsHumanEscalation = msgCount >= 8;\n  \n  const languageInstruction = lang === 'dz'\n    ? 'Speak Algerian Arabic (Darija). Use words like \"صح\", \"واش\", \"هادا\", \"برك\", \"دوك\".'\n    : lang === 'ar'\n      ? 'Speak Arabic (العربية).'\n      : 'Speak French. Respond in French.';\n  \n  const orderInfo = order.id\n    ? `Order #${order.id.substring(0,8)} | Product: ${order.product || 'N/A'} | Amount: ${order.amount || 'N/A'} DA | Customer: ${order.customer_name || 'N/A'} | Status: ${order.status || 'pending'} | Phone: ${order.phone || 'N/A'} | Wilaya: ${order.wilaya || 'N/A'} | Commune: ${order.commune || 'N/A'}`\n    : 'No order information available.';\n  \n  const merchantPrompt = settings.system_prompt || '';\n  const fallbackMsg = settings.fallback_message || 'Désolé, je n\\'ai pas compris. Pouvez-vous reformuler ?';\n  const handoffMsg = settings.handoff_message || 'Un agent va vous contacter sous peu. Merci pour votre patience.';\n  \n  const historyText = history.map(h => `${h.role}: ${h.message}`).join('\\n');\n  \n  const systemContent = [\n    merchantPrompt ? `=== MERCHANT INSTRUCTIONS ===\\n${merchantPrompt}\\n=== END MERCHANT INSTRUCTIONS ===` : '',\n    `You are an AI Order Confirmation Agent. You work for \"${store.store_name || store.name || 'the store'}\".`,\n    `Your ONLY job is to confirm or process customer orders via WhatsApp. You are NOT a salesman.`,\n    `You NEVER invent order information. ONLY use the database values provided below.`,\n    `You NEVER modify data without explicit customer confirmation.`,\n    `Be polite, professional, and helpful.`,\n    `${languageInstruction}`,\n    `Understand and respond to messages in Darija, Arabic, French, or English as appropriate.`,\n    `\\n=== CURRENT ORDER ===\\n${orderInfo}`,\n    historyText ? `\\n=== CONVERSATION HISTORY (last ${history.length} messages) ===\\n${historyText}` : '',\n    `\\n=== RESPONSE RULES ===`,\n    `You MUST respond ONLY with valid JSON. Never include any text outside the JSON.`,\n    `Supported intents: confirm, cancel, change_address, change_phone, change_wilaya, change_commune, question, human`,\n    `- confirm: Customer explicitly confirms the order (e.g. \"oui je confirme\", \"صح\", \"ok\" )`,\n    `- cancel: Customer explicitly cancels (e.g. \"annuler\", \"non merci\", \"لاغي\" )`,\n    `- change_address: Customer wants to change delivery address entirely`,\n    `- change_phone: Customer provides a new phone number`,\n    `- change_wilaya: Customer changes wilaya (province/state)`,\n    `- change_commune: Customer changes commune (city/district)`,\n    `- question: Customer asks a question about the order, delivery, payment`,\n    `- human: Customer is angry, asks for manager, or requests human support`,\n    ``,\n    `IMPORTANT ESCALATION RULES:`,\n    `- If customer is angry, aggressive, or explicitly asks for a manager → use intent \"human\"`,\n    `- If you are unsure or cannot understand → use intent \"question\" and ask for clarification`,\n    `- Never confirm unless the customer EXPLICITLY confirms`,\n    `- If confidence in intent is below 0.65, set lower confidence value`,\n    ``,\n    `RESPONSE FORMAT:`,\n    `{\"intent\": \"string (one of the 8 intents)\", \"reply\": \"string (your response to the customer in the correct language)\", \"confidence\": 0.0-1.0}`\n  ].filter(Boolean).join('\\n\\n');\n  \n  const messages = [\n    { role: 'system', content: systemContent },\n    ...history.map(h => ({ role: h.role === 'customer' ? 'user' : 'assistant', content: h.message })),\n    { role: 'user', content: `Customer message: ${j._message_text || 'The customer is responding to the order confirmation.'}` }\n  ];\n  \n  return {\n    json: {\n      ...j,\n      _store: store,\n      _order: order,\n      _ai_settings: settings,\n      _history: history,\n      _openai_messages: messages,\n      _model: settings.model || 'gpt-4o-mini',\n      _temperature: Number(settings.temperature) || 0.7,\n      _msg_count: msgCount,\n      _needs_escalation: needsHumanEscalation,\n      _fallback_message: fallbackMsg,\n      _handoff_message: handoffMsg,\n      _language: lang\n    }\n  };\n});"
+      },
+      "id": "build-prompt",
+      "name": "Build Prompt & Check Escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [2550, 300],
+      "notes": "Builds OpenAI messages array with: merchant system prompt, order info, conversation history, response rules. Checks if message count >= 8 for auto-escalation.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.OPENAI_API_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"model\": $json._model, \"messages\": $json._openai_messages, \"temperature\": $json._temperature, \"max_tokens\": 500, \"response_format\": { \"type\": \"json_object\" } } }}",
+        "options": { "timeout": 30000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "call-openai",
+      "name": "Call OpenAI GPT-4o-mini",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2800, 300],
+      "notes": "Calls OpenAI Chat Completions API. Uses response_format: json_object to enforce JSON-only responses. Model and temperature from merchant AI settings.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nconst startTime = Date.now();\nreturn items.map(item => {\n  const j = item.json;\n  const choice = j.choices?.[0]?.message;\n  if (!choice) {\n    return { json: { ...j, _parse_error: true, _ai_intent: 'human', _ai_reply: j._fallback_message || 'Désolé, une erreur est survenue.', _ai_confidence: 0, _tokens_used: 0, _latency_ms: 0, _model_used: 'error' } };\n  }\n  const content = choice.content || '';\n  const tokensUsed = j.usage?.total_tokens || 0;\n  const latencyMs = Date.now() - startTime;\n  const modelUsed = j.model || 'gpt-4o-mini';\n  try {\n    const parsed = JSON.parse(content);\n    return {\n      json: {\n        ...j,\n        _ai_intent: (parsed.intent || 'question').toLowerCase(),\n        _ai_reply: parsed.reply || 'Merci pour votre message.',\n        _ai_confidence: Math.min(1, Math.max(0, Number(parsed.confidence) || 0.5)),\n        _ai_raw: parsed,\n        _tokens_used: tokensUsed,\n        _latency_ms: latencyMs,\n        _model_used: modelUsed,\n        _parse_error: false\n      }\n    };\n  } catch (e) {\n    const jsonMatch = content.match(/\\{[\\s\\S]*\\}/);\n    if (jsonMatch) {\n      try {\n        const parsed = JSON.parse(jsonMatch[0]);\n        return {\n          json: {\n            ...j,\n            _ai_intent: (parsed.intent || 'question').toLowerCase(),\n            _ai_reply: parsed.reply || content.substring(0, 500),\n            _ai_confidence: Math.min(1, Math.max(0, Number(parsed.confidence) || 0.3)),\n            _ai_raw: parsed,\n            _tokens_used: tokensUsed,\n            _latency_ms: latencyMs,\n            _model_used: modelUsed,\n            _parse_error: true\n          }\n        };\n      } catch (e2) {}\n    }\n    return {\n      json: {\n        ...j,\n        _ai_intent: 'question',\n        _ai_reply: content.substring(0, 500) || 'Merci pour votre message.',\n        _ai_confidence: 0.3,\n        _ai_raw: { intent: 'question', reply: content.substring(0, 500) },\n        _tokens_used: tokensUsed,\n        _latency_ms: latencyMs,\n        _model_used: modelUsed,\n        _parse_error: true\n      }\n    };\n  }\n});"
+      },
+      "id": "parse-ai-json",
+      "name": "Parse AI JSON Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [3050, 300],
+      "notes": "Extracts intent, reply, confidence from OpenAI JSON response. Falls back to regex extraction if JSON.parse fails. Tracks tokens and latency.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [
+            { "id": "c-check", "leftValue": "={{ $json._ai_confidence }}", "rightValue": "={{ Number($json._ai_settings?.min_confidence || 0.65) }}", "operator": { "type": "number", "operation": "largerEqual" } },
+            { "id": "esc-check", "leftValue": "={{ $json._needs_escalation }}", "rightValue": true, "operator": { "type": "boolean", "operation": "notEqual" } },
+            { "id": "parse-check", "leftValue": "={{ $json._parse_error }}", "rightValue": true, "operator": { "type": "boolean", "operation": "notEqual" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-confidence",
+      "name": "High Confidence?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [3300, 300],
+      "notes": "Checks: 1) confidence >= min_confidence (default 0.65), 2) message count < 8 (auto-escalation), 3) no parse error. Failing any → escalate to human.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const j = item.json;\n  return {\n    json: {\n      ...j,\n      _ai_intent: 'human',\n      _ai_reply: j._handoff_message || 'Un agent va vous contacter sous peu. Merci pour votre patience.',\n      _ai_confidence: 0,\n      _escalation_reason: j._parse_error\n        ? 'AI response parse error'\n        : j._needs_escalation\n          ? 'Message limit exceeded (' + j._msg_count + ' messages)'\n          : 'Low confidence (' + j._ai_confidence + ' < ' + (j._ai_settings?.min_confidence || 0.65) + ')'\n    }\n  };\n});"
+      },
+      "id": "escalate-human",
+      "name": "Escalate to Human",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [3300, 500],
+      "notes": "Forces human escalation when: low confidence, parse error, or >8 messages exchanged. Sets intent to 'human' with handoff message.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json._ai_intent }}",
+        "rules": {
+          "string": {
+            "rules": [
+              { "output": 0, "value2": "confirm" },
+              { "output": 1, "value2": "cancel" },
+              { "output": 2, "value2": "change_address" },
+              { "output": 3, "value2": "change_phone" },
+              { "output": 4, "value2": "change_wilaya" },
+              { "output": 5, "value2": "change_commune" },
+              { "output": 6, "value2": "question" },
+              { "output": 7, "value2": "human" }
+            ]
+          }
+        },
+        "options": {},
+        "fallbackOutput": 6
+      },
+      "id": "route-intent",
+      "name": "Route Intent",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 2,
+      "position": [3550, 300],
+      "notes": "Routes to intent handler based on AI's detected intent. Unknown intent falls back to 'question' handler.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(async item => {\n  const j = item.json;\n  const supabaseUrl = $env.SUPABASE_URL;\n  const serviceKey = $env.SUPABASE_SERVICE_KEY;\n  const headers = { 'apikey': serviceKey, 'Authorization': 'Bearer ' + serviceKey, 'Content-Type': 'application/json' };\n  const orderId = j._order?.id || j._order_id || '';\n  const storeId = j._store?.id || j.id || j._store_id;\n  try {\n    await fetch(supabaseUrl + '/rest/v1/orders?id=eq.' + encodeURIComponent(orderId), {\n      method: 'PATCH', headers,\n      body: JSON.stringify({ status: 'confirmed', notes: 'Confirmed via AI Agent' })\n    });\n    await fetch(supabaseUrl + '/rest/v1/rpc/insert_order_activity', {\n      method: 'POST', headers,\n      body: JSON.stringify({ p_order_id: orderId, p_activity_type: 'confirmed', p_description: 'Order confirmed by customer via AI Agent' })\n    });\n  } catch (e) {}\n  return { json: { ...j, _order_update: { status: 'confirmed' } } };\n});"
+      },
+      "id": "handle-confirm",
+      "name": "Handle Confirm",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [3800, 100],
+      "notes": "Updates order status to confirmed. Inserts activity record. Notifies merchant downstream.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(async item => {\n  const j = item.json;\n  const supabaseUrl = $env.SUPABASE_URL;\n  const serviceKey = $env.SUPABASE_SERVICE_KEY;\n  const headers = { 'apikey': serviceKey, 'Authorization': 'Bearer ' + serviceKey, 'Content-Type': 'application/json' };\n  const orderId = j._order?.id || j._order_id || '';\n  try {\n    await fetch(supabaseUrl + '/rest/v1/orders?id=eq.' + encodeURIComponent(orderId), {\n      method: 'PATCH', headers,\n      body: JSON.stringify({ status: 'cancelled', notes: 'Cancelled via AI Agent' })\n    });\n    await fetch(supabaseUrl + '/rest/v1/rpc/insert_order_activity', {\n      method: 'POST', headers,\n      body: JSON.stringify({ p_order_id: orderId, p_activity_type: 'cancelled', p_description: 'Order cancelled by customer via AI Agent' })\n    });\n  } catch (e) {}\n  return { json: { ...j, _order_update: { status: 'cancelled' } } };\n});"
+      },
+      "id": "handle-cancel",
+      "name": "Handle Cancel",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [3800, 240],
+      "notes": "Updates order status to cancelled. Inserts activity record.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(async item => {\n  const j = item.json;\n  const supabaseUrl = $env.SUPABASE_URL;\n  const serviceKey = $env.SUPABASE_SERVICE_KEY;\n  const headers = { 'apikey': serviceKey, 'Authorization': 'Bearer ' + serviceKey, 'Content-Type': 'application/json' };\n  const orderId = j._order?.id || j._order_id || '';\n  const reply = j._ai_reply || '';\n  const addressMatch = reply.match(/address[\\s\\S]*?wilaya[\\s:]*(\\w+)/i);\n  const communeMatch = reply.match(/commune[\\s:]*(\\w+)/i);\n  const updateData = {};\n  if (addressMatch) updateData.wilaya = addressMatch[1];\n  if (communeMatch) updateData.commune = communeMatch[1];\n  updateData.notes = 'Address updated via AI Agent';\n  try {\n    await fetch(supabaseUrl + '/rest/v1/orders?id=eq.' + encodeURIComponent(orderId), {\n      method: 'PATCH', headers,\n      body: JSON.stringify(updateData)\n    });\n  } catch (e) {}\n  return { json: { ...j, _order_update: updateData } };\n});"
+      },
+      "id": "handle-address",
+      "name": "Handle Change Address",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [3800, 380],
+      "notes": "Updates wilaya and commune on the order based on AI-parsed address.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(async item => {\n  const j = item.json;\n  const supabaseUrl = $env.SUPABASE_URL;\n  const serviceKey = $env.SUPABASE_SERVICE_KEY;\n  const headers = { 'apikey': serviceKey, 'Authorization': 'Bearer ' + serviceKey, 'Content-Type': 'application/json' };\n  const orderId = j._order?.id || j._order_id || '';\n  const reply = j._ai_reply || '';\n  const phoneMatch = reply.match(/[\\+]?[0-9]{10,15}/);\n  const newPhone = phoneMatch ? phoneMatch[0] : '';\n  try {\n    if (newPhone) {\n      await fetch(supabaseUrl + '/rest/v1/orders?id=eq.' + encodeURIComponent(orderId), {\n        method: 'PATCH', headers,\n        body: JSON.stringify({ phone: newPhone, notes: 'Phone updated via AI Agent' })\n      });\n    }\n  } catch (e) {}\n  return { json: { ...j, _order_update: newPhone ? { phone: newPhone } : {} } };\n});"
+      },
+      "id": "handle-phone",
+      "name": "Handle Change Phone",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [3800, 520],
+      "notes": "Extracts new phone number from AI reply and updates order. Phone numbers are validated to be 10-15 digits.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(async item => {\n  const j = item.json;\n  const supabaseUrl = $env.SUPABASE_URL;\n  const serviceKey = $env.SUPABASE_SERVICE_KEY;\n  const headers = { 'apikey': serviceKey, 'Authorization': 'Bearer ' + serviceKey, 'Content-Type': 'application/json' };\n  const orderId = j._order?.id || j._order_id || '';\n  const reply = j._ai_reply || '';\n  const wilayaMatch = reply.match(/wilaya[\\s:]*(\\w+(?:\\s+\\w+)*)/i);\n  const newWilaya = wilayaMatch ? wilayaMatch[1].trim() : '';\n  try {\n    if (newWilaya) {\n      await fetch(supabaseUrl + '/rest/v1/orders?id=eq.' + encodeURIComponent(orderId), {\n        method: 'PATCH', headers,\n        body: JSON.stringify({ wilaya: newWilaya, notes: 'Wilaya updated via AI Agent' })\n      });\n    }\n  } catch (e) {}\n  return { json: { ...j, _order_update: newWilaya ? { wilaya: newWilaya } : {} } };\n});"
+      },
+      "id": "handle-wilaya",
+      "name": "Handle Change Wilaya",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [3800, 660],
+      "notes": "Extracts new wilaya (province) from AI reply and updates order.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(async item => {\n  const j = item.json;\n  const supabaseUrl = $env.SUPABASE_URL;\n  const serviceKey = $env.SUPABASE_SERVICE_KEY;\n  const headers = { 'apikey': serviceKey, 'Authorization': 'Bearer ' + serviceKey, 'Content-Type': 'application/json' };\n  const orderId = j._order?.id || j._order_id || '';\n  const reply = j._ai_reply || '';\n  const communeMatch = reply.match(/commune[\\s:]*(\\w+(?:\\s+\\w+)*)/i);\n  const newCommune = communeMatch ? communeMatch[1].trim() : '';\n  try {\n    if (newCommune) {\n      await fetch(supabaseUrl + '/rest/v1/orders?id=eq.' + encodeURIComponent(orderId), {\n        method: 'PATCH', headers,\n        body: JSON.stringify({ commune: newCommune, notes: 'Commune updated via AI Agent' })\n      });\n    }\n  } catch (e) {}\n  return { json: { ...j, _order_update: newCommune ? { commune: newCommune } : {} } };\n});"
+      },
+      "id": "handle-commune",
+      "name": "Handle Change Commune",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [3800, 800],
+      "notes": "Extracts new commune (city) from AI reply and updates order.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  return { json: { ...item.json, _order_update: null } };\n});"
+      },
+      "id": "handle-question",
+      "name": "Handle Question",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [3800, 940],
+      "notes": "No DB update needed for questions. Just passes through to reply.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(async item => {\n  const j = item.json;\n  const supabaseUrl = $env.SUPABASE_URL;\n  const serviceKey = $env.SUPABASE_SERVICE_KEY;\n  const headers = { 'apikey': serviceKey, 'Authorization': 'Bearer ' + serviceKey, 'Content-Type': 'application/json' };\n  const storeId = j._store?.id || j.id || j._store_id;\n  const orderId = j._order?.id || j._order_id || '';\n  const reason = j._escalation_reason || 'Customer requested human support';\n  try {\n    await fetch(supabaseUrl + '/rest/v1/rpc/insert_notification', {\n      method: 'POST', headers,\n      body: JSON.stringify({\n        p_store_id: storeId,\n        p_type: 'ai_escalated',\n        p_title: 'AI Escalation',\n        p_message: 'Customer requires human assistance: ' + reason,\n        p_data: { order_id: orderId, phone: j._phone, reason: reason }\n      })\n    });\n  } catch (e) {}\n  return { json: { ...j, _escalated: true, _order_update: null } };\n});"
+      },
+      "id": "handle-human",
+      "name": "Handle Human Escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [3800, 1080],
+      "notes": "Creates notification for merchant that human support is needed. Does not update order status.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/save_ai_message' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"p_store_id\": $json._store?.id || $json.id || $json._store_id, \"p_order_id\": $json._order?.id || $json._order_id, \"p_phone\": $json._phone, \"p_role\": \"assistant\", \"p_message\": $json._ai_reply, \"p_tokens\": $json._tokens_used || 0 } }}",
+        "options": { "timeout": 10000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "save-conversation",
+      "name": "Save AI Reply to History",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [4200, 300],
+      "notes": "Saves the AI's reply message to ai_conversations table for conversation continuity.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/log_ai_interaction' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"p_store_id\": $json._store?.id || $json.id || $json._store_id, \"p_order_id\": $json._order?.id || $json._order_id, \"p_phone\": $json._phone, \"p_intent\": $json._ai_intent, \"p_confidence\": $json._ai_confidence, \"p_latency_ms\": $json._latency_ms, \"p_model\": $json._model_used, \"p_tokens_used\": $json._tokens_used || 0, \"p_customer_message\": $json._message_text, \"p_ai_reply\": $json._ai_reply, \"p_escalated\": $json._escalated || false } }}",
+        "options": { "timeout": 10000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "save-ai-log",
+      "name": "Save AI Analytics Log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [4450, 300],
+      "notes": "Logs AI interaction analytics: intent, confidence, latency, model, tokens, escalation status.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/insert_notification' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ (() => {\n  const j = $json;\n  let type = 'ai_reply';\n  let title = 'AI Agent Reply';\n  if (j._ai_intent === 'confirm') { type = 'order_confirmed'; title = 'Order Confirmed'; }\n  else if (j._ai_intent === 'cancel') { type = 'order_cancelled'; title = 'Order Cancelled'; }\n  else if (j._ai_intent === 'human') { type = 'ai_escalated'; title = 'AI Escalation'; }\n  else if (['change_address','change_phone','change_wilaya','change_commune'].includes(j._ai_intent)) { type = 'order_modified'; title = 'Order Modified'; }\n  return {\n    p_store_id: j._store?.id || j.id || j._store_id,\n    p_type: type,\n    p_title: title,\n    p_message: (j._ai_reply || '').substring(0, 500),\n    p_data: { order_id: j._order?.id || j._order_id, phone: j._phone, intent: j._ai_intent, confidence: j._ai_confidence }\n  };\n})() }}",
+        "options": { "timeout": 10000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "notify-merchant",
+      "name": "Notify Merchant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [4700, 300],
+      "notes": "Inserts notification for merchant. Notification type varies by intent: confirmed, cancelled, escalated, modified.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const j = item.json;\n  const store = j._store || j;\n  const phoneNumberId = store.phone_number_id;\n  const accessToken = store.access_token;\n  const replyText = j._ai_reply || 'Merci pour votre message.';\n  const truncated = replyText.length > 4000 ? replyText.substring(0, 4000) : replyText;\n  return {\n    json: {\n      ...j,\n      _whatsapp_payload: {\n        url: 'https://graph.facebook.com/v18.0/' + phoneNumberId + '/messages',\n        headers: {\n          'Authorization': 'Bearer ' + accessToken,\n          'Content-Type': 'application/json'\n        },\n        body: {\n          messaging_product: 'whatsapp',\n          recipient_type: 'individual',\n          to: j._phone,\n          type: 'text',\n          text: { body: truncated }\n        }\n      }\n    }\n  };\n});"
+      },
+      "id": "build-whatsapp-payload",
+      "name": "Build WhatsApp Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [4950, 300],
+      "notes": "Builds Meta WhatsApp Cloud API payload. Uses store's phone_number_id and access_token. Truncates to 4096 char limit.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json._whatsapp_payload.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ $json._whatsapp_payload.body }}",
+        "options": { "timeout": 30000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "send-whatsapp",
+      "name": "Send WhatsApp Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [5200, 300],
+      "notes": "Sends AI reply via Meta WhatsApp Cloud API. Continue on Fail enabled for error tracking.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": true, \"intent\": $json._ai_intent, \"reply\": $json._ai_reply, \"confidence\": $json._ai_confidence, \"escalated\": $json._escalated || false, \"latency_ms\": $json._latency_ms, \"tokens_used\": $json._tokens_used || 0} }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "ack-webhook",
+      "name": "Acknowledge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [5450, 300],
+      "notes": "Returns 200 with intent, reply, confidence, escalation status, latency, and token usage.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [250, 700],
+      "notes": "Catches any unhandled error in the workflow. Routes to dead letter queue for investigation.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const d = item.json;\n  const errMsg = d.errorMessage || d.error || d._error || 'Unknown workflow error';\n  const errCode = d.errorCode || d.statusCode || '500';\n  return {\n    json: {\n      _dlq_store_id: d._store_id || d.store_id || d.id || null,\n      _dlq_error_message: String(errMsg).substring(0, 1000),\n      _dlq_error_code: String(errCode),\n      _dlq_input_data: {\n        store_id: d._store_id || d.store_id,\n        phone: d._phone || d.phone,\n        order_id: d._order_id || d.order_id,\n        message_text: (d._message_text || '').substring(0, 200)\n      }\n    }\n  };\n});"
+      },
+      "id": "format-dlq",
+      "name": "Format Error for DLQ",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [500, 700],
+      "notes": "Formats error data for dead letter queue. Extracts error message, code, and input context.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/insert_dead_letter' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"p_store_id\": $json._dlq_store_id, \"p_error_message\": $json._dlq_error_message, \"p_error_code\": $json._dlq_error_code, \"p_input_data\": $json._dlq_input_data, \"p_node_name\": \"OrderConfirm AI Agent\" } }}",
+        "options": { "timeout": 10000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "insert-dlq",
+      "name": "Insert Dead Letter Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [750, 700],
+      "notes": "Inserts error into dead_letter_queue table for monitoring and replay.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Receive WhatsApp Message": {
+      "main": [[{ "node": "Validate & Extract", "type": "main", "index": 0 }]]
+    },
+    "Validate & Extract": {
+      "main": [[{ "node": "Valid Input?", "type": "main", "index": 0 }]]
+    },
+    "Valid Input?": {
+      "main": [
+        [{ "node": "Find Store", "type": "main", "index": 0 }],
+        [{ "node": "Error Response 400", "type": "main", "index": 0 }]
+      ]
+    },
+    "Find Store": {
+      "main": [[{ "node": "Store Found?", "type": "main", "index": 0 }]]
+    },
+    "Store Found?": {
+      "main": [
+        [{ "node": "Get AI Settings", "type": "main", "index": 0 }],
+        [{ "node": "Store Error Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Get AI Settings": {
+      "main": [[{ "node": "AI Enabled?", "type": "main", "index": 0 }]]
+    },
+    "AI Enabled?": {
+      "main": [
+        [{ "node": "Find Latest Customer Order", "type": "main", "index": 0 }],
+        [{ "node": "AI Disabled Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Find Latest Customer Order": {
+      "main": [[{ "node": "Order Found?", "type": "main", "index": 0 }]]
+    },
+    "Order Found?": {
+      "main": [
+        [{ "node": "Load Conversation History", "type": "main", "index": 0 }],
+        [{ "node": "Order Error Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Load Conversation History": {
+      "main": [[{ "node": "Build Prompt & Check Escalation", "type": "main", "index": 0 }]]
+    },
+    "Build Prompt & Check Escalation": {
+      "main": [[{ "node": "Call OpenAI GPT-4o-mini", "type": "main", "index": 0 }]]
+    },
+    "Call OpenAI GPT-4o-mini": {
+      "main": [[{ "node": "Parse AI JSON Response", "type": "main", "index": 0 }]]
+    },
+    "Parse AI JSON Response": {
+      "main": [[{ "node": "High Confidence?", "type": "main", "index": 0 }]]
+    },
+    "High Confidence?": {
+      "main": [
+        [{ "node": "Route Intent", "type": "main", "index": 0 }],
+        [{ "node": "Escalate to Human", "type": "main", "index": 0 }]
+      ]
+    },
+    "Escalate to Human": {
+      "main": [[{ "node": "Route Intent", "type": "main", "index": 0 }]]
+    },
+    "Route Intent": {
+      "main": [
+        [{ "node": "Handle Confirm", "type": "main", "index": 0 }],
+        [{ "node": "Handle Cancel", "type": "main", "index": 0 }],
+        [{ "node": "Handle Change Address", "type": "main", "index": 0 }],
+        [{ "node": "Handle Change Phone", "type": "main", "index": 0 }],
+        [{ "node": "Handle Change Wilaya", "type": "main", "index": 0 }],
+        [{ "node": "Handle Change Commune", "type": "main", "index": 0 }],
+        [{ "node": "Handle Question", "type": "main", "index": 0 }],
+        [{ "node": "Handle Human Escalation", "type": "main", "index": 0 }]
+      ]
+    },
+    "Handle Confirm": {
+      "main": [[{ "node": "Save AI Reply to History", "type": "main", "index": 0 }]]
+    },
+    "Handle Cancel": {
+      "main": [[{ "node": "Save AI Reply to History", "type": "main", "index": 0 }]]
+    },
+    "Handle Change Address": {
+      "main": [[{ "node": "Save AI Reply to History", "type": "main", "index": 0 }]]
+    },
+    "Handle Change Phone": {
+      "main": [[{ "node": "Save AI Reply to History", "type": "main", "index": 0 }]]
+    },
+    "Handle Change Wilaya": {
+      "main": [[{ "node": "Save AI Reply to History", "type": "main", "index": 0 }]]
+    },
+    "Handle Change Commune": {
+      "main": [[{ "node": "Save AI Reply to History", "type": "main", "index": 0 }]]
+    },
+    "Handle Question": {
+      "main": [[{ "node": "Save AI Reply to History", "type": "main", "index": 0 }]]
+    },
+    "Handle Human Escalation": {
+      "main": [[{ "node": "Save AI Reply to History", "type": "main", "index": 0 }]]
+    },
+    "Save AI Reply to History": {
+      "main": [[{ "node": "Save AI Analytics Log", "type": "main", "index": 0 }]]
+    },
+    "Save AI Analytics Log": {
+      "main": [[{ "node": "Notify Merchant", "type": "main", "index": 0 }]]
+    },
+    "Notify Merchant": {
+      "main": [[{ "node": "Build WhatsApp Payload", "type": "main", "index": 0 }]]
+    },
+    "Build WhatsApp Payload": {
+      "main": [[{ "node": "Send WhatsApp Reply", "type": "main", "index": 0 }]]
+    },
+    "Send WhatsApp Reply": {
+      "main": [[{ "node": "Acknowledge", "type": "main", "index": 0 }]]
+    },
+    "Error Handler": {
+      "main": [[{ "node": "Format Error for DLQ", "type": "main", "index": 0 }]]
+    },
+    "Format Error for DLQ": {
+      "main": [[{ "node": "Insert Dead Letter Queue", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "Africa/Algiers"
+  },
+  "tags": [
+    { "name": "AI Agent", "id": "tag-ai" },
+    { "name": "WhatsApp", "id": "tag-wa" },
+    { "name": "OrderConfirm DZ", "id": "tag-oc" }
+  ],
+  "pinData": {},
+  "versionId": "2.0.0"
+}

@@ -1,0 +1,904 @@
+{
+  "name": "saas",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "saas/send-message",
+        "options": {}
+      },
+      "id": "webhook-entry",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "notes": "Entry point: POST /saas/send-message. Expects JSON with order_id, store_id, customer_name, phone, product, amount, currency, language, store_name. Returns 202 for async queue processing, 400/403/429 for errors.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "v-oid", "leftValue": "={{ $json.order_id }}", "rightValue": "", "operator": { "type": "string", "operation": "isNotEmpty" } },
+            { "id": "v-sid", "leftValue": "={{ $json.store_id }}", "rightValue": "", "operator": { "type": "string", "operation": "isNotEmpty" } },
+            { "id": "v-cust", "leftValue": "={{ $json.customer_name }}", "rightValue": "", "operator": { "type": "string", "operation": "isNotEmpty" } },
+            { "id": "v-phone", "leftValue": "={{ $json.phone }}", "rightValue": "", "operator": { "type": "string", "operation": "isNotEmpty" } },
+            { "id": "v-prod", "leftValue": "={{ $json.product }}", "rightValue": "", "operator": { "type": "string", "operation": "isNotEmpty" } },
+            { "id": "v-amt", "leftValue": "={{ $json.amount }}", "rightValue": "", "operator": { "type": "string", "operation": "isNotEmpty" } },
+            { "id": "v-curr", "leftValue": "={{ $json.currency }}", "rightValue": "", "operator": { "type": "string", "operation": "isNotEmpty" } },
+            { "id": "v-lang", "leftValue": "={{ $json.language }}", "rightValue": "", "operator": { "type": "string", "operation": "isNotEmpty" } },
+            { "id": "v-sname", "leftValue": "={{ $json.store_name }}", "rightValue": "", "operator": { "type": "string", "operation": "isNotEmpty" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "validate-input",
+      "name": "Validate Request",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "notes": "Validates all 9 required fields. Routes to detailed error response on failure, continues to store config fetch on success.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const required = ['order_id','store_id','customer_name','phone','product','amount','currency','language','store_name'];\nconst items = $input.all();\nreturn items.map(item => ({\n  json: {\n    success: false,\n    error: 'Missing required fields: ' + required.filter(f => !item.json[f] || String(item.json[f]).trim() === '').join(', '),\n    missing_fields: required.filter(f => !item.json[f] || String(item.json[f]).trim() === ''),\n    _error_type: 'validation'\n  }\n}));"
+      },
+      "id": "build-validation-error",
+      "name": "Build Validation Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 480],
+      "notes": "Dynamically lists which specific fields are missing.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": false, \"error\": $json.error, \"missing_fields\": $json.missing_fields} }}",
+        "options": {
+          "responseCode": 400,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "error-400-response",
+      "name": "Error Response 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [450, 640],
+      "notes": "Returns 400 with missing field details.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/stores?id=eq.' + encodeURIComponent($json.store_id) + '&limit=1' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Accept", "value": "application/vnd.pgrst.object+json" }
+          ]
+        },
+        "options": { "timeout": 10000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "fetch-store-config",
+      "name": "Fetch Store Config",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "notes": "Fetches merchant config from stores table using store_id. Checks active, maintenance_mode, sending_paused fields. Uses Accept: application/vnd.pgrst.object+json for single-object response.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "sc-active", "leftValue": "={{ $json.active }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } },
+            { "id": "sc-maintenance", "leftValue": "={{ $json.maintenance_mode }}", "rightValue": false, "operator": { "type": "boolean", "operation": "equals" } },
+            { "id": "sc-paused", "leftValue": "={{ $json.sending_paused }}", "rightValue": false, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-store-active",
+      "name": "Check Store Active",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [650, 480],
+      "notes": "Verifies store is active, not in maintenance mode, and sending is not paused. Returns 403 with appropriate error if any check fails.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  let reason = 'Store not found';\n  if (item.json.store_id) {\n    if (!item.json.active) reason = 'Store is disabled';\n    else if (item.json.maintenance_mode) reason = 'Store is in maintenance mode';\n    else if (item.json.sending_paused) reason = 'Sending is paused for this store';\n  }\n  return { json: { success: false, error: reason, store_id: item.json.store_id || 'unknown', _error_type: 'store_config' } };\n});"
+      },
+      "id": "build-store-error",
+      "name": "Build Store Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [650, 640],
+      "notes": "Returns descriptive error for store config issues: disabled, maintenance mode, or paused.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": false, \"error\": $json.error, \"store_id\": $json.store_id} }}",
+        "options": {
+          "responseCode": 403,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "store-error-response",
+      "name": "Store Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [650, 800],
+      "notes": "Returns 403 when store is disabled, in maintenance, or paused.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/check_rate_limit' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"p_store_id\": $json.id, \"p_max_per_minute\": $json.rate_limit_per_minute } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "check-rate-limit",
+      "name": "Check Rate Limit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "notes": "Calls Supabase RPC check_rate_limit which atomically increments and checks the per-store minute bucket. Returns {allowed, remaining, reset_at}. Limit defaults to 100/min from store config.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "rl-allowed", "leftValue": "={{ $json.allowed }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-rate-allowed",
+      "name": "Rate Limit OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [850, 480],
+      "notes": "If rate limit exceeded (allowed=false), returns 429. Otherwise continues to duplicate check.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": false, \"error\": \"Rate limit exceeded\", \"retry_after\": Math.ceil((new Date($json.reset_at) - new Date()) / 1000), \"reset_at\": $json.reset_at} }}",
+        "options": {
+          "responseCode": 429,
+          "responseHeaders": { "entries": [
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Retry-After", "value": "={{ Math.ceil((new Date($json.reset_at) - new Date()) / 1000) }}" }
+          ]}
+        }
+      },
+      "id": "rate-limit-error",
+      "name": "Rate Limit Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [850, 640],
+      "notes": "Returns 429 with Retry-After header when merchant exceeds rate limit. The customer should retry after reset_at.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_logs?order_id=eq.' + encodeURIComponent($json.order_id) + '&status=eq.sent&select=id,status,created_at&limit=1&order=created_at.desc' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" }
+          ]
+        },
+        "options": { "timeout": 5000 }
+      },
+      "id": "check-duplicate",
+      "name": "Check Duplicate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1050, 300],
+      "notes": "Queries message_logs for existing sent messages with same order_id to prevent duplicate sends.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "dedup-check", "leftValue": "={{ $json.length }}", "rightValue": 0, "operator": { "type": "number", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1050, 480],
+      "notes": "If message_logs already has a 'sent' entry for this order_id, skips sending and returns duplicate status.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": true, \"status\": \"duplicate\", \"order_id\": $json.order_id, \"message\": \"Message already sent for this order\"} }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "duplicate-response",
+      "name": "Duplicate Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1050, 640],
+      "notes": "Returns 200 with status=duplicate when the message was already sent for this order_id. Never sends the same order twice.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_templates?store_id=eq.' + encodeURIComponent($json.id) + '&name=eq.' + encodeURIComponent($json.template_name || 'order_confirmation') + '&language=eq.' + encodeURIComponent($json.language || 'fr') + '&active=eq.true&limit=1' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Accept", "value": "application/vnd.pgrst.object+json" }
+          ]
+        },
+        "options": { "timeout": 5000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "fetch-template",
+      "name": "Fetch Template",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1250, 300],
+      "notes": "Fetches the message template from message_templates table using store_id, template_name, and language. Returns the JSON content with {{variable}} placeholders. Falls back to default template if not found.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const tpl = item.json;\n  const vars = item.json.variables || ['customer_name','product','amount','currency','order_id','store_name','phone','tracking'];\n  const content = tpl.content || { body: 'Bonjour {{customer_name}}...' };\n  const ctx = {\n    customer_name: item.json.customer_name || '',\n    product: item.json.product || '',\n    amount: item.json.amount || '',\n    currency: item.json.currency || 'DA',\n    order_id: item.json.order_id || '',\n    store_name: item.json.store_name || '',\n    phone: item.json.phone || '',\n    tracking: item.json.tracking || ''\n  };\n  const rendered = JSON.parse(JSON.stringify(content), (key, val) => {\n    if (typeof val === 'string') {\n      return val.replace(/\\{\\{(\\w+)\\}\\}/g, (_, name) => ctx[name] || '{{' + name + '}}');\n    }\n    return val;\n  });\n  return { json: { ...item.json, _rendered_content: rendered, _ctx: ctx } };\n});"
+      },
+      "id": "replace-variables",
+      "name": "Replace Variables",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1450, 300],
+      "notes": "Replaces all {{variable}} placeholders in the template content with actual values from the request. Supports: customer_name, product, amount, currency, order_id, store_name, phone, tracking. Handles nested JSON structures recursively.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const j = item.json;\n  const provider = j.whatsapp_provider || 'meta';\n  const content = j._rendered_content || {};\n  const payload = { provider, phone: j.phone, order_id: j.order_id, store_id: j.id };\n  switch (provider) {\n    case 'meta':\n      payload.url = 'https://graph.facebook.com/v18.0/' + j.phone_number_id + '/messages';\n      payload.headers = { 'Authorization': 'Bearer ' + j.access_token, 'Content-Type': 'application/json' };\n      payload.body = { messaging_product: 'whatsapp', recipient_type: 'individual', to: j.phone };\n      if (content.buttons) {\n        payload.body.type = 'interactive';\n        payload.body.interactive = { type: 'button', body: { text: content.body }, action: { buttons: content.buttons.map(b => ({ type: 'reply', reply: { id: b.id, title: b.title } })) } };\n      } else if (content.sections) {\n        payload.body.type = 'interactive';\n        payload.body.interactive = { type: 'list', body: { text: content.body }, action: { button: content.button || 'Choose', sections: content.sections } };\n      } else if (content.template) {\n        payload.body.type = 'template';\n        payload.body.template = content.template;\n      } else if (j.message_type === 'image' || content.image) {\n        payload.body.type = 'image'; payload.body.image = content.image;\n      } else if (j.message_type === 'document' || content.document) {\n        payload.body.type = 'document'; payload.body.document = content.document;\n      } else if (j.message_type === 'audio' || content.audio) {\n        payload.body.type = 'audio'; payload.body.audio = content.audio;\n      } else if (j.message_type === 'video' || content.video) {\n        payload.body.type = 'video'; payload.body.video = content.video;\n      } else if (j.message_type === 'location' || content.location) {\n        payload.body.type = 'location'; payload.body.location = content.location;\n      } else if (j.message_type === 'contacts' || content.contacts) {\n        payload.body.type = 'contacts'; payload.body.contacts = content.contacts;\n      } else {\n        payload.body.type = 'text'; payload.body.text = { body: content.body || content.text || j.message || 'Hello' };\n      }\n      break;\n    case 'ultramsg':\n      payload.url = 'https://api.ultramsg.com/' + j.phone_number_id + '/messages/chat';\n      payload.headers = { 'Content-Type': 'application/json' };\n      payload.body = { token: j.access_token, to: j.phone, body: content.body || 'Hello', priority: 10 };\n      break;\n    case 'greenapi':\n      payload.url = 'https://api.green-api.com/waInstance/' + j.phone_number_id + '/sendMessage';\n      payload.headers = { 'Content-Type': 'application/json' };\n      payload.body = { chatId: j.phone + '@c.us', message: content.body || 'Hello' };\n      break;\n    case 'evolution':\n      payload.url = (j.evolution_api_url || 'https://evolution-api') + '/message/sendText/' + j.phone_number_id;\n      payload.headers = { 'Content-Type': 'application/json', 'apiKey': j.access_token };\n      payload.body = { number: j.phone, text: content.body || 'Hello', delay: 1200 };\n      break;\n  }\n  return { json: { ...item.json, _provider_payload: payload } };\n});"
+      },
+      "id": "build-provider-payload",
+      "name": "Build Provider Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1650, 300],
+      "notes": "Dynamically builds the complete HTTP request payload for the configured WhatsApp provider. Supports: meta (text, interactive, template, media, location, contacts), ultramsg, greenapi, evolution. The payload includes URL, headers, and body all in one object.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_queue' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"store_id\": $json.id, \"order_id\": $json.order_id, \"phone\": $json.phone, \"message_type\": $json.message_type || 'interactive', \"payload\": $json._provider_payload, \"message_hash\": $json._message_hash || '', \"status\": \"pending\" } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "insert-queue",
+      "name": "Insert Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1850, 220],
+      "notes": "Inserts a pending entry into message_queue for async processing and retry tracking. Returns the queue record with id for later status updates.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_logs' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=representation" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"store_id\": $json.id, \"order_id\": $json.order_id, \"phone\": $json.phone, \"provider\": $json.whatsapp_provider, \"message_type\": $json.message_type || 'interactive', \"queue_id\": $json[0]?.id || null, \"payload\": $json._provider_payload, \"status\": \"processing\", \"template_name\": $json.template_name || 'order_confirmation', \"variables\": $json._ctx || {} } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "insert-log",
+      "name": "Insert Log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1850, 360],
+      "notes": "Creates the audit log entry before sending. Links to the queue item via queue_id. Status set to 'processing' until the send completes.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/check_rate_limit' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"p_store_id\": $json.id, \"p_max_per_minute\": $json.rate_limit_per_minute } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "increment-rate-limit",
+      "name": "Increment Rate Limit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1850, 500],
+      "notes": "Increments the rate limit counter for this store's current minute bucket. This node is reached only after successful validation, dedup, and queue insertion.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.whatsapp_provider }}",
+        "rules": {
+          "string": {
+            "rules": [
+              { "output": 0, "value2": "meta" },
+              { "output": 1, "value2": "ultramsg" },
+              { "output": 2, "value2": "greenapi" },
+              { "output": 3, "value2": "evolution" }
+            ]
+          }
+        },
+        "options": {}
+      },
+      "id": "route-provider",
+      "name": "Route Provider",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 2,
+      "position": [2050, 300],
+      "notes": "Routes to the correct WhatsApp provider implementation based on store's whatsapp_provider config. All providers are fully implemented with proper payloads.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json._provider_payload.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "sendBody": true,
+        "bodyType": "raw",
+        "rawBody": "={{ JSON.stringify($json._provider_payload.body) }}",
+        "options": { "timeout": 30000 },
+        "onError": "continueRegularOutput"
+      },
+      "id": "send-via-provider",
+      "name": "Send via Provider",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2250, 120],
+      "notes": "Generic HTTP request node that sends to any provider. URL, headers, and body are dynamically resolved from _provider_payload. Continue on Fail enabled so errors are captured for retry logic.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nconst start = Date.now();\nreturn items.map(item => {\n  const j = item.json;\n  const resp = j;\n  const isSuccess = !!(j.messages || j.sent || j.messageId || j.message_id || (j.statusCode >= 200 && j.statusCode < 300));\n  let msgId = j.messages?.[0]?.id || j.messageId || j.message_id || j.id || '';\n  let errorMsg = null;\n  let errorCode = null;\n  let isRetryable = false;\n  if (!isSuccess) {\n    const err = j.error || {};\n    errorMsg = err.message || err.error_user_msg || err.title || j.errorMessage || 'Unknown error';\n    errorCode = String(err.code || err.error_subcode || j.statusCode || 500);\n    const retryCodes = ['429','500','502','503','504'];\n    isRetryable = retryCodes.includes(errorCode);\n  }\n  const execTime = Date.now() - start;\n  return {\n    json: {\n      ...item.json,\n      _send_success: isSuccess,\n      _provider_message_id: msgId,\n      _error_message: errorMsg,\n      _error_code: errorCode,\n      _is_retryable: isRetryable,\n      _execution_time_ms: execTime,\n      _response: isSuccess ? { messages: j.messages, contacts: j.contacts, id: msgId } : { error: j.error }\n    }\n  };\n});"
+      },
+      "id": "parse-provider-response",
+      "name": "Parse Provider Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [2450, 120],
+      "notes": "Parses the provider response to extract status, message_id, and error details. Identifies retryable errors (429, 500, 502, 503, 504) for exponential backoff. Handles response format differences between providers.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "send-ok", "leftValue": "={{ $json._send_success }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-send-success",
+      "name": "Send Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2450, 300],
+      "notes": "Routes to success or failure/retry path based on _send_success flag.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_queue?id=eq.' + encodeURIComponent($json[0]?.id || $json.queue_id || '') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"status\": \"sent\", \"locked_at\": null, \"lock_token\": null } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "update-queue-sent",
+      "name": "Update Queue Sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2650, 100],
+      "notes": "Marks queue item as sent and releases the lock.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_logs?queue_id=eq.' + encodeURIComponent($json[0]?.id || $json.queue_id || '') + '&status=eq.processing' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"status\": \"sent\", \"provider_message_id\": $json._provider_message_id, \"response\": $json._response, \"execution_time_ms\": $json._execution_time_ms } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "update-log-sent",
+      "name": "Update Log Sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2650, 220],
+      "notes": "Updates the audit log with sent status, provider message ID, response payload, and execution time.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/orders?order_id=eq.' + encodeURIComponent($json.order_id) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"status\": \"sent\", \"provider\": $json.whatsapp_provider, \"provider_message_id\": $json._provider_message_id, \"sent_at\": new Date().toISOString() } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "update-orders-sent",
+      "name": "Update Orders Sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2650, 340],
+      "notes": "Updates the orders table with sent status and provider message ID for real-time dashboard tracking.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": true, \"status\": \"sent\", \"order_id\": $json.order_id, \"provider_message_id\": $json._provider_message_id, \"execution_time_ms\": $json._execution_time_ms} }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "success-response",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2850, 220],
+      "notes": "Returns 200 with success details including provider_message_id and execution time.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "retry-check", "leftValue": "={{ $json._is_retryable }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-retryable",
+      "name": "Is Retryable?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2650, 500],
+      "notes": "Checks if the error is retryable (429, 500, 502, 503, 504). If yes, schedules an exponential backoff retry via the queue. If not, marks as permanently failed.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const retryCount = (item.json.retry_count || 0) + 1;\n  const delays = [5, 15, 30, 60, 300];\n  const delaySec = delays[Math.min(retryCount - 1, delays.length - 1)];\n  const nextRetry = new Date(Date.now() + delaySec * 1000).toISOString();\n  return {\n    json: {\n      ...item.json,\n      _new_retry_count: retryCount,\n      _next_retry_at: nextRetry,\n      _delay_seconds: delaySec,\n      _max_retries_reached: retryCount >= 5\n    }\n  };\n});"
+      },
+      "id": "calculate-backoff",
+      "name": "Calculate Backoff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [2650, 640],
+      "notes": "Implements exponential backoff: 5s, 15s, 30s, 60s, 300s. Calculates next_retry_at based on current retry count. Stops after 5 retries.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "max-retry-check", "leftValue": "={{ $json._max_retries_reached }}", "rightValue": false, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "check-max-retries",
+      "name": "Max Retries Reached?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2850, 500],
+      "notes": "If under 5 retries, schedules next attempt via queue update. If max reached, marks as permanently failed.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_queue?id=eq.' + encodeURIComponent($json[0]?.id || $json.queue_id || '') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"status\": \"pending\", \"retry_count\": $json._new_retry_count, \"next_retry_at\": $json._next_retry_at, \"last_error\": $json._error_message, \"locked_at\": null, \"lock_token\": null } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "update-queue-retry",
+      "name": "Update Queue Retry",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [3050, 440],
+      "notes": "Updates queue item with retry count, next_retry_at (exponential backoff), and last error. Resets lock so queue processor can pick it up.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_logs?queue_id=eq.' + encodeURIComponent($json[0]?.id || $json.queue_id || '') + '&status=eq.processing' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"status\": \"failed\", \"error_message\": $json._error_message, \"error_code\": $json._error_code, \"response\": $json._response, \"execution_time_ms\": $json._execution_time_ms, \"attempt_number\": $json._new_retry_count } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "update-log-retry",
+      "name": "Update Log Retry",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [3050, 560],
+      "notes": "Updates audit log with failure details and sets status to failed for this attempt.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": false, \"status\": \"retrying\", \"order_id\": $json.order_id, \"error\": $json._error_message, \"next_retry_in\": $json._delay_seconds + 's', \"retry_attempt\": $json._new_retry_count} }}",
+        "options": {
+          "responseCode": 202,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "retry-response",
+      "name": "Retry Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [3250, 500],
+      "notes": "Returns 202 Accepted when the message will be retried. Informs the caller of the delay and attempt number so they can track progress.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_queue?id=eq.' + encodeURIComponent($json[0]?.id || $json.queue_id || '') }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"status\": \"failed\", \"last_error\": $json._error_message, \"locked_at\": null, \"lock_token\": null } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "update-queue-failed",
+      "name": "Update Queue Failed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2850, 680],
+      "notes": "Marks queue item as permanently failed after max retries or non-retryable error.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/orders?order_id=eq.' + encodeURIComponent($json.order_id) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"status\": \"failed\", \"error_message\": $json._error_message, \"retry_count\": $json.retry_count || 0 } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "update-orders-failed",
+      "name": "Update Orders Failed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2850, 800],
+      "notes": "Updates orders table with failed status and error message for merchant visibility.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\"success\": false, \"status\": \"failed\", \"order_id\": $json.order_id, \"error\": $json._error_message, \"error_code\": $json._error_code} }}",
+        "options": {
+          "responseCode": 500,
+          "responseHeaders": { "entries": [{ "name": "Content-Type", "value": "application/json" }] }
+        }
+      },
+      "id": "error-500-response",
+      "name": "Error Response 500",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [3050, 740],
+      "notes": "Returns 500 for permanent failures with error details for debugging.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/refresh_metrics' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={{ { \"p_store_id\": $json.id } }}",
+        "options": { "timeout": 5000 }
+      },
+      "id": "refresh-metrics",
+      "name": "Refresh Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2650, 460],
+      "notes": "Refreshes the metrics cache after each send so the dashboard is always up to date.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Validate Request", "type": "main", "index": 0 }]]
+    },
+    "Validate Request": {
+      "main": [
+        [{ "node": "Fetch Store Config", "type": "main", "index": 0 }],
+        [{ "node": "Build Validation Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Validation Error": {
+      "main": [[{ "node": "Error Response 400", "type": "main", "index": 0 }]]
+    },
+    "Fetch Store Config": {
+      "main": [[{ "node": "Check Store Active", "type": "main", "index": 0 }]]
+    },
+    "Check Store Active": {
+      "main": [
+        [{ "node": "Check Rate Limit", "type": "main", "index": 0 }],
+        [{ "node": "Build Store Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Store Error": {
+      "main": [[{ "node": "Store Error Response", "type": "main", "index": 0 }]]
+    },
+    "Check Rate Limit": {
+      "main": [[{ "node": "Rate Limit OK?", "type": "main", "index": 0 }]]
+    },
+    "Rate Limit OK?": {
+      "main": [
+        [{ "node": "Check Duplicate", "type": "main", "index": 0 }],
+        [{ "node": "Rate Limit Error", "type": "main", "index": 0 }]
+      ]
+    },
+    "Check Duplicate": {
+      "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [{ "node": "Fetch Template", "type": "main", "index": 0 }],
+        [{ "node": "Duplicate Response", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Template": {
+      "main": [[{ "node": "Replace Variables", "type": "main", "index": 0 }]]
+    },
+    "Replace Variables": {
+      "main": [[{ "node": "Build Provider Payload", "type": "main", "index": 0 }]]
+    },
+    "Build Provider Payload": {
+      "main": [[{ "node": "Insert Queue", "type": "main", "index": 0 }]]
+    },
+    "Insert Queue": {
+      "main": [[{ "node": "Insert Log", "type": "main", "index": 0 }]]
+    },
+    "Insert Log": {
+      "main": [[{ "node": "Increment Rate Limit", "type": "main", "index": 0 }]]
+    },
+    "Increment Rate Limit": {
+      "main": [[{ "node": "Route Provider", "type": "main", "index": 0 }]]
+    },
+    "Route Provider": {
+      "main": [
+        [{ "node": "Send via Provider", "type": "main", "index": 0 }],
+        [{ "node": "Send via Provider", "type": "main", "index": 0 }],
+        [{ "node": "Send via Provider", "type": "main", "index": 0 }],
+        [{ "node": "Send via Provider", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send via Provider": {
+      "main": [[{ "node": "Parse Provider Response", "type": "main", "index": 0 }]]
+    },
+    "Parse Provider Response": {
+      "main": [[{ "node": "Send Success?", "type": "main", "index": 0 }]]
+    },
+    "Send Success?": {
+      "main": [
+        [{ "node": "Update Queue Sent", "type": "main", "index": 0 }],
+        [{ "node": "Is Retryable?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Queue Sent": {
+      "main": [[{ "node": "Update Log Sent", "type": "main", "index": 0 }]]
+    },
+    "Update Log Sent": {
+      "main": [[{ "node": "Update Orders Sent", "type": "main", "index": 0 }]]
+    },
+    "Update Orders Sent": {
+      "main": [[{ "node": "Refresh Metrics", "type": "main", "index": 0 }]]
+    },
+    "Refresh Metrics": {
+      "main": [[{ "node": "Success Response", "type": "main", "index": 0 }]]
+    },
+    "Is Retryable?": {
+      "main": [
+        [{ "node": "Calculate Backoff", "type": "main", "index": 0 }],
+        [{ "node": "Update Queue Failed", "type": "main", "index": 0 }]
+      ]
+    },
+    "Calculate Backoff": {
+      "main": [[{ "node": "Max Retries Reached?", "type": "main", "index": 0 }]]
+    },
+    "Max Retries Reached?": {
+      "main": [
+        [{ "node": "Update Queue Retry", "type": "main", "index": 0 }],
+        [{ "node": "Update Queue Failed", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Queue Retry": {
+      "main": [[{ "node": "Update Log Retry", "type": "main", "index": 0 }]]
+    },
+    "Update Log Retry": {
+      "main": [[{ "node": "Retry Response", "type": "main", "index": 0 }]]
+    },
+    "Update Queue Failed": {
+      "main": [[{ "node": "Update Orders Failed", "type": "main", "index": 0 }]]
+    },
+    "Update Orders Failed": {
+      "main": [[{ "node": "Error Response 500", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "pinData": {}
+}

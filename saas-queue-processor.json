@@ -1,0 +1,567 @@
+{
+  "name": "saas-queue-processor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": 5
+        },
+        "triggerTimes": {
+          "item": [{ "mode": "everyMinute" }]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Cron Trigger (every 5s)",
+      "type": "n8n-nodes-base.interval",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "notes": "Polls every 5 seconds for pending queue items. Uses n8n Interval trigger — install the n8n-nodes-base interval package if not available, or replace with Cron (every minute) and process up to batch_size items per run.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const batchSize = 10;\nconst items = [];\nfor (let i = 0; i < batchSize; i++) {\n  items.push({ json: { _batch_index: i } });\n}\nreturn items;\n"
+      },
+      "id": "fan-out",
+      "name": "Fan Out (batch)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "notes": "Creates batch_size parallel items so multiple queue items can be claimed in one workflow run. Adjust batch_size to match throughput needs.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/claim_next_message' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"p_lock_minutes\": 2 }",
+        "options": { "timeout": 15000 }
+      },
+      "id": "claim-next",
+      "name": "Claim Next Message",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "notes": "Calls claim_next_message(2) RPC. Returns the claimed queue ID or null. The function atomically picks the next pending message ordered by priority desc, created_at asc, and locks it to prevent duplicate processing.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [{ "id": "has-id", "leftValue": "={{ $json }}", "rightValue": null, "operator": { "type": "number", "operation": "isNotEmpty" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "claimed-if",
+      "name": "Claimed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "notes": "Checks if claim_next_message returned a valid integer ID. If null, no pending messages — exit early.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  if (!item.json) return item;\n  const id = typeof item.json === 'number' ? item.json : item.json.id || null;\n  return { json: { _queue_id: id } };\n});"
+      },
+      "id": "extract-queue-id",
+      "name": "Extract Queue ID",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1050, 200],
+      "notes": "Normalizes the RPC response (may be a number directly or wrapped in { id }). Builds _queue_id for downstream nodes.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_queue?id=eq.' + $json._queue_id + '&select=*,stores!inner(id,store_name,whatsapp_provider,access_token,phone_number_id,business_account_id,meta_waba_id,evolution_base_url,evolution_instance,evolution_token,ultramsg_instance_id,ultramsg_token,greenapi_instance,greenapi_token,active,maintenance_mode,sending_paused)order_id:orders!inner(order_id,status,customer_name,phone,product,amount,currency)orders!inner(order_id,status,customer_name,phone,product,amount,currency)message_templates!inner(id,name,content)' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" }
+          ]
+        },
+        "options": { "timeout": 15000 }
+      },
+      "id": "fetch-queue-record",
+      "name": "Fetch Queue Record",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "notes": "Fetches queue item with join to stores, orders, and templates to get all data needed for sending.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [{ "id": "has-record", "leftValue": "={{ $json[0] }}", "rightValue": null, "operator": { "type": "array", "operation": "isNotEmpty" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "record-found-if",
+      "name": "Record Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1450, 200],
+      "notes": "Ensures queue record and store data were successfully fetched.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const rec = item.json[0];\n  const store = rec.stores || {};\n  const order = rec.orders || {};\n  const template = rec.message_templates || {};\n  \n  // If payload already stored, use it directly\n  if (rec.payload) return { json: { ...rec, _provider_payload: rec.payload, store, order, template } };\n  \n  // Otherwise rebuild payload (legacy items)\n  const provider = store.whatsapp_provider || 'meta';\n  const content = template.content || {};\n  const ctx = rec.variables || {};\n  const rendered = JSON.parse(JSON.stringify(content), (key, val) => {\n    if (typeof val === 'string') return val.replace(/\\{\\{(\\w+)\\}\\}/g, (_, name) => ctx[name] || '{{' + name + '}}');\n    return val;\n  });\n  \n  const payload = { provider, phone: rec.phone, order_id: rec.order_id, store_id: rec.store_id };\n  switch (provider) {\n    case 'meta':\n      payload.url = 'https://graph.facebook.com/v18.0/' + store.phone_number_id + '/messages';\n      payload.headers = { 'Authorization': 'Bearer ' + store.access_token, 'Content-Type': 'application/json' };\n      payload.body = { messaging_product: 'whatsapp', recipient_type: 'individual', to: rec.phone };\n      if (rendered.buttons) {\n        payload.body.type = 'interactive';\n        payload.body.interactive = { type: 'button', body: { text: rendered.body }, action: { buttons: rendered.buttons.map(b => ({ type: 'reply', reply: { id: b.id, title: b.title } })) } };\n      } else if (rendered.sections) {\n        payload.body.type = 'interactive';\n        payload.body.interactive = { type: 'list', body: { text: rendered.body }, action: { button: rendered.button || 'Choose', sections: rendered.sections } };\n      } else if (rendered.template) {\n        payload.body.type = 'template';\n        payload.body.template = rendered.template;\n      } else if (rec.message_type === 'image' || rendered.image) {\n        payload.body.type = 'image'; payload.body.image = rendered.image || { link: rendered.image };\n      } else if (rec.message_type === 'document' || rendered.document) {\n        payload.body.type = 'document'; payload.body.document = rendered.document || { link: rendered.document };\n      } else if (rec.message_type === 'audio' || rendered.audio) {\n        payload.body.type = 'audio'; payload.body.audio = rendered.audio || { link: rendered.audio };\n      } else if (rec.message_type === 'video' || rendered.video) {\n        payload.body.type = 'video'; payload.body.video = rendered.video || { link: rendered.video };\n      } else if (rec.message_type === 'location' || rendered.location) {\n        payload.body.type = 'location'; payload.body.location = rendered.location;\n      } else if (rec.message_type === 'text' || rendered.text) {\n        payload.body.type = 'text'; payload.body.text = { body: rendered.text || rendered.body };\n      } else {\n        payload.body.type = 'text'; payload.body.text = { body: rendered.body || rec.payload?.body || '' };\n      }\n      break;\n    case 'ultramsg':\n      payload.url = 'https://api.ultramsg.com/' + store.ultramsg_instance_id + '/messages/chat';\n      payload.headers = { 'Content-Type': 'application/x-www-form-urlencoded' };\n      payload.body = { token: store.ultramsg_token, to: rec.phone, body: rendered.body || rec.payload?.body || '' };\n      break;\n    case 'greenapi':\n      payload.url = 'https://api.greenapi.com/waInstance' + store.greenapi_instance + '/sendMessage/' + store.greenapi_token;\n      payload.headers = { 'Content-Type': 'application/json' };\n      payload.body = { chatId: rec.phone + '@c.us', message: rendered.body || rec.payload?.body || '' };\n      break;\n    case 'evolution':\n      payload.url = store.evolution_base_url + '/message/sendText/' + store.evolution_instance;\n      payload.headers = { 'Content-Type': 'application/json', 'apikey': store.evolution_token };\n      payload.body = { number: rec.phone, text: rendered.body || rec.payload?.body || '', delay: 1200 };\n      break;\n  }\n  \n  return { json: { ...rec, _provider_payload: payload, store, order, template } };\n});"
+      },
+      "id": "build-payload",
+      "name": "Build Provider Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1650, 100],
+      "notes": "Rebuilds provider payload from stored queue data. First tries to use stored payload; falls back to rebuilding from template + variables. Supports all 4 providers and all message types.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json._provider_payload.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": []
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "rawBody": "={{ JSON.stringify($json._provider_payload.body) }}",
+        "options": {
+          "timeout": 15000,
+          "continueOnFail": true,
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "id": "send-via-provider",
+      "name": "Send via Provider",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1850, 100],
+      "notes": "Sends the message via the provider. URL, headers, and body are fully dynamic from _provider_payload. continueOnFail enabled so errors are captured.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const j = item.json;\n  const { statusCode, headers } = item;\n  const body = j;\n  const success = statusCode >= 200 && statusCode < 300;\n  const providerMsgId = body?.messages?.[0]?.id || body?.message_id || body?.id || '';\n  return { json: { ...j, _send_success: success, _provider_message_id: providerMsgId, _status_code: statusCode, _response_body: body, _error: success ? null : (body?.error?.message || body?.message || 'HTTP ' + statusCode) } };\n});"
+      },
+      "id": "parse-response",
+      "name": "Parse Provider Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [2050, 100],
+      "notes": "Parses provider response. Extracts message ID on success, error details on failure.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [{ "id": "send-ok", "leftValue": "={{ $json._send_success }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "send-ok-if",
+      "name": "Send Successful?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2250, 100],
+      "notes": "Routes success vs failure to appropriate update paths.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_queue?id=eq.' + $json._queue_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"status\": \"sent\", \"locked_at\": null, \"locked_by\": null, \"lock_token\": null }",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-queue-sent",
+      "name": "Update Queue Sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2450, 0],
+      "notes": "Marks queue item as 'sent' and releases lock.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_logs?queue_id=eq.' + $json._queue_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"status\": \"sent\", \"provider_message_id\": \"{{ $json._provider_message_id }}\" }",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-log-sent",
+      "name": "Update Log Sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2450, 100],
+      "notes": "Updates message_logs with sent status and provider message ID.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/orders?order_id=eq.' + encodeURIComponent($json.order_id) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"provider_message_id\": \"{{ $json._provider_message_id }}\", \"sent_at\": \"{{ new Date().toISOString() }}\" }",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-orders-sent",
+      "name": "Update Orders Sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2450, 200],
+      "notes": "Updates orders table with provider_message_id and sent_at timestamp.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/refresh_metrics' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"p_store_id\": \"{{ $json.store_id }}\" }",
+        "options": { "timeout": 10000 }
+      },
+      "id": "refresh-metrics-processor",
+      "name": "Refresh Metrics (success)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2450, 300],
+      "notes": "Refreshes metrics cache after successful send.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "code": "const items = $input.all();\nreturn items.map(item => {\n  const j = item.json;\n  const retryCount = (j.retry_count || 0) + 1;\n  const maxRetries = j.max_retries || 5;\n  const backoffSeconds = [5, 15, 30, 60, 300];\n  const delay = backoffSeconds[Math.min(retryCount - 1, backoffSeconds.length - 1)];\n  const nextRetry = new Date(Date.now() + delay * 1000).toISOString();\n  const maxed = retryCount >= maxRetries;\n  return { json: { ...j, _new_retry_count: retryCount, _next_retry_at: nextRetry, _max_retries_reached: maxed, _delay: delay } };\n});"
+      },
+      "id": "calc-backoff",
+      "name": "Calculate Backoff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [2450, 450],
+      "notes": "Calculates exponential backoff: attempt 1→5s, 2→15s, 3→30s, 4→60s, 5→300s. After max retries, marks as failed permanently.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [{ "id": "maxed", "leftValue": "={{ $json._max_retries_reached }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "max-retries-if",
+      "name": "Max Retries Reached?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2650, 450],
+      "notes": "If max retries reached, mark as permanently failed. Otherwise, schedule retry with backoff.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_queue?id=eq.' + $json._queue_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"status\": \"failed\", \"retry_count\": {{ $json._new_retry_count }}, \"last_error\": \"{{ $json._error }}\", \"locked_at\": null, \"locked_by\": null, \"lock_token\": null }",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-queue-failed",
+      "name": "Update Queue Failed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2850, 380],
+      "notes": "Marks queue item as failed permanently.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_logs?queue_id=eq.' + $json._queue_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"status\": \"failed\", \"error_message\": \"{{ $json._error }}\" }",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-log-failed",
+      "name": "Update Log Failed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2850, 480],
+      "notes": "Updates message_logs with failed status and error.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/orders?order_id=eq.' + encodeURIComponent($json.order_id) }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"status\": \"failed\", \"error_message\": \"{{ $json._error }}\" }",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-orders-failed",
+      "name": "Update Orders Failed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2850, 580],
+      "notes": "Updates orders table with failed status.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_queue?id=eq.' + $json._queue_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"status\": \"pending\", \"retry_count\": {{ $json._new_retry_count }}, \"next_retry_at\": \"{{ $json._next_retry_at }}\", \"last_error\": \"{{ $json._error }}\", \"locked_at\": null, \"locked_by\": null, \"lock_token\": null }",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-queue-retry",
+      "name": "Update Queue Retry",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2850, 700],
+      "notes": "Updates queue item with incremented retry_count, next_retry_at for backoff, and last_error. Status set back to 'pending' so it can be picked up again by claim_next_message.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/message_logs?queue_id=eq.' + $json._queue_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "Prefer", "value": "return=minimal" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"status\": \"pending\", \"error_message\": \"{{ $json._error }}\" }",
+        "options": { "timeout": 10000 }
+      },
+      "id": "update-log-retry",
+      "name": "Update Log Retry",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2850, 800],
+      "notes": "Updates message_logs back to pending for retry.",
+      "notesInFlow": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL + '/rest/v1/rpc/refresh_metrics' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "apikey", "value": "={{ $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $env.SUPABASE_SERVICE_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyType": "json",
+        "jsonBody": "={ \"p_store_id\": \"{{ $json.store_id }}\" }",
+        "options": { "timeout": 10000 }
+      },
+      "id": "refresh-metrics-retry",
+      "name": "Refresh Metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2850, 900],
+      "notes": "Refreshes metrics cache after retry/failure update.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Cron Trigger (every 5s)": {
+      "main": [[{ "node": "Fan Out (batch)", "type": "main", "index": 0 }]]
+    },
+    "Fan Out (batch)": {
+      "main": [[{ "node": "Claim Next Message", "type": "main", "index": 0 }]]
+    },
+    "Claim Next Message": {
+      "main": [[{ "node": "Claimed?", "type": "main", "index": 0 }]]
+    },
+    "Claimed?": {
+      "main": [
+        [{ "node": "Extract Queue ID", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Extract Queue ID": {
+      "main": [[{ "node": "Fetch Queue Record", "type": "main", "index": 0 }]]
+    },
+    "Fetch Queue Record": {
+      "main": [[{ "node": "Record Found?", "type": "main", "index": 0 }]]
+    },
+    "Record Found?": {
+      "main": [
+        [{ "node": "Build Provider Payload", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Build Provider Payload": {
+      "main": [[{ "node": "Send via Provider", "type": "main", "index": 0 }]]
+    },
+    "Send via Provider": {
+      "main": [[{ "node": "Parse Provider Response", "type": "main", "index": 0 }]]
+    },
+    "Parse Provider Response": {
+      "main": [[{ "node": "Send Successful?", "type": "main", "index": 0 }]]
+    },
+    "Send Successful?": {
+      "main": [
+        [{ "node": "Update Queue Sent", "type": "main", "index": 0 }],
+        [{ "node": "Calculate Backoff", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Queue Sent": {
+      "main": [[{ "node": "Update Log Sent", "type": "main", "index": 0 }]]
+    },
+    "Update Log Sent": {
+      "main": [[{ "node": "Update Orders Sent", "type": "main", "index": 0 }]]
+    },
+    "Update Orders Sent": {
+      "main": [[{ "node": "Refresh Metrics (success)", "type": "main", "index": 0 }]]
+    },
+    "Refresh Metrics (success)": {
+      "main": [[]]
+    },
+    "Calculate Backoff": {
+      "main": [[{ "node": "Max Retries Reached?", "type": "main", "index": 0 }]]
+    },
+    "Max Retries Reached?": {
+      "main": [
+        [{ "node": "Update Queue Failed", "type": "main", "index": 0 }],
+        [{ "node": "Update Queue Retry", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Queue Failed": {
+      "main": [[{ "node": "Update Log Failed", "type": "main", "index": 0 }]]
+    },
+    "Update Log Failed": {
+      "main": [[{ "node": "Update Orders Failed", "type": "main", "index": 0 }]]
+    },
+    "Update Orders Failed": {
+      "main": [[{ "node": "Refresh Metrics", "type": "main", "index": 0 }]]
+    },
+    "Update Queue Retry": {
+      "main": [[{ "node": "Update Log Retry", "type": "main", "index": 0 }]]
+    },
+    "Update Log Retry": {
+      "main": [[{ "node": "Refresh Metrics", "type": "main", "index": 0 }]]
+    },
+    "Refresh Metrics": {
+      "main": [[]]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "tags": [],
+  "pinData": {}
+}
