@@ -91,7 +91,7 @@ export function AddOrderModal({ isOpen, onClose, onSuccess }: AddOrderModalProps
       let webhookFailed = false;
       const webhookUrl = process.env.NEXT_PUBLIC_N8N_WEBHOOK_URL;
 
-      if (webhookUrl) {
+      alert("Webhook URL = " + webhookUrl); if (webhookUrl) {
         try {
           const webhookPayload = {
             order_id: data?.[0]?.id,
